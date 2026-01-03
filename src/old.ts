@@ -5,11 +5,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // Type definitions
-interface ConversationMessage {
-    role: 'user' | 'model';
-    parts: string;
-}
-
 interface ImageGenerationData {
     prompt: string;
     generatedImages?: any[]; // Store the generated output images for regeneration
@@ -33,9 +28,6 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
 const IMAGE_MODEL_NAME = "models/gemini-3-pro-image-preview";
 const TEXT_MODEL_NAME = "models/gemini-2.5-flash";
 
-// Store conversation history: messageId -> history
-const conversationHistory = new Map<string, ConversationMessage[]>();
-
 // Store image generation metadata: messageId -> generation data
 const imageMetadata = new Map<string, ImageGenerationData>();
 
@@ -44,18 +36,6 @@ client.once('ready', () => {
     console.log(`Image Model: ${IMAGE_MODEL_NAME}`);
     console.log(`Text Model: ${TEXT_MODEL_NAME}`);
 });
-
-// Helper function to detect if user wants image generation
-function wantsImageGeneration(text: string): boolean {
-    const imageKeywords = [
-        'generate', 'create', 'make', 'draw', 'image', 'picture', 
-        'photo', 'render', 'art', 'artwork', 'illustration', 'sketch',
-        'design', 'visualize', 'show me', 'paint'
-    ];
-    
-    const lowerText = text.toLowerCase();
-    return imageKeywords.some(keyword => lowerText.includes(keyword));
-}
 
 // Helper function to extract prompt from text
 function extractPrompt(text: string): string {
@@ -84,6 +64,53 @@ function supportsTyping(channel: any): channel is { sendTyping: () => Promise<vo
     return 'sendTyping' in channel && typeof channel.sendTyping === 'function';
 }
 
+// Refine prompt using AI for better image generation
+async function refinePromptForImageGeneration(rawPrompt: string): Promise<string> {
+    const refinementPrompt = `You are an expert at extracting creative descriptions from user prompts for AI image generation.
+
+Your job is to extract and organize the CREATIVE CONTENT ONLY from the user's prompt. Focus on:
+- What the creature/model looks like (colors, features, characteristics)
+- What the background environment is (setting, objects, atmosphere)
+- The mood and feeling (spooky, cheerful, mysterious, etc.)
+- Special effects or details (lighting, particles, weather)
+- Any pose or action the creature should do
+
+DO NOT include technical requirements like:
+- Composition rules (centering, prominence, focal points, percentages)
+- Art style specifics (pixel art, voxel, resolution)
+- Camera angles or framing
+- Integration instructions (shadows, grounding, etc.)
+
+Keep it clean and creative. Remove conversational phrases like "generate this", "maybe", "could you", "give me".
+
+Organize the output into simple sections:
+**Creature:** [description of the model/creature]
+**Background:** [description of the environment/setting]
+**Mood:** [atmosphere and feeling]
+**Pose/Action:** [what the creature is doing - if not specified, suggest a natural, lively pose that fits the creature's character]
+
+User's prompt:
+${rawPrompt}
+
+Refined creative description (output ONLY the description, no explanations):`;
+
+    try {
+        const model = genAI.getGenerativeModel({ model: TEXT_MODEL_NAME });
+        const result = await model.generateContent(refinementPrompt);
+        const response = await result.response;
+        const refined = response.text().trim();
+        
+        console.log(`[REFINEMENT] Original: "${rawPrompt}"`);
+        console.log(`[REFINEMENT] Refined: "${refined}"`);
+        
+        // Fallback to original if refinement fails or is empty
+        return refined || rawPrompt;
+    } catch (error) {
+        console.error('[REFINEMENT] Failed, using original prompt:', error);
+        return rawPrompt; // Fallback to original prompt
+    }
+}
+
 // Process image generation
 async function generateImages(
     message: Message, 
@@ -102,8 +129,8 @@ async function generateImages(
         }
         
         const statusText = isRegeneration 
-            ? "🔄 **Regenerating with modifications...** Please wait."
-            : "🎨 **Generating variants...** Please wait.";
+            ? "🔄 **Step 1/3:** Preparing to regenerate..."
+            : "🎨 **Step 1/3:** Preparing your image generation...";
         statusMessage = await message.reply(statusText);
 
         // Keep typing indicator active
@@ -113,16 +140,41 @@ async function generateImages(
             }
         }, 5000);
 
+        // Update status: Refining prompt
+        await statusMessage.edit("✨ **Step 2/3:** Optimizing your prompt with AI...");
+        
+        // Refine the prompt using AI
+        const refinedPrompt = await refinePromptForImageGeneration(promptText);
+
         // Prepare prompt with better structure
         const finalPrompt = `
 <system_instructions>
-Generate an image based on the user's prompt.
+Generate an image based on the user's creative description below.
 Default Aspect Ratio: 16:9 Landscape (unless the user specifies otherwise).
-Maintain high visual fidelity and follow the style instructions closely.
+
+ART STYLE:
+- PIXEL ART aesthetic. Medium resolution (16-bit era quality).
+- NOT photorealistic. NOT 3D rendered. NOT high-definition/HD/4K.
+
+COMPOSITION & FOCUS:
+- The provided reference model (3D voxel creature/object) is the MAIN FOCAL POINT.
+- Position it in the CENTER of the composition.
+- Make it LARGE and PROMINENT - easily visible, clearly detailed, and the primary subject that draws the eye.
+- Reference model = 60% visual importance.
+- Background environment = 30% visual importance (pixel art, sets mood).
+- Effects/atmosphere = 10% visual importance (enhances without distracting).
+
+INTEGRATION & POSING:
+- The reference model must be naturally integrated with proper shadows, realistic lighting match, and solid grounding.
+- The model should NEVER look awkward, floating, static, or pasted on.
+- Pose the creature/model in a NATURAL, DYNAMIC, and LIVELY way that fits its character and the scene.
+- Choose an interesting, characterful pose that makes the creature feel alive (not a stiff T-pose or static stance).
+- Apply proper lighting to make the model stand out from the background.
+- Camera angle: Slight 3/4 view or front view to clearly showcase the reference model.
 </system_instructions>
 
 <user_prompt>
-${promptText}
+${refinedPrompt}
 </user_prompt>
 `.trim();
 
@@ -171,11 +223,14 @@ ${promptText}
             console.log(`[DEBUG] Added ${attachments.length} message attachments.`);
         }
 
+        // Update status: Generating images
+        await statusMessage.edit("🖼️ **Step 3/3:** Generating 3 image variants... (this may take 30-60 seconds)");
+        
         // Call Gemini API
         console.log(`[DEBUG] Calling Gemini API with model: ${IMAGE_MODEL_NAME}`);
         const model = genAI.getGenerativeModel({ model: IMAGE_MODEL_NAME });
         
-        // Generate 2 variants in parallel
+        // Generate 3 variants in parallel
         const variantCount = 3;
         const generationPromises = Array(variantCount).fill(null).map(() => model.generateContent(inputs));
 
@@ -223,8 +278,9 @@ ${promptText}
             });
             
             // Store metadata for potential regeneration with the generated images
+            // Store the refined prompt so regenerations maintain quality
             imageMetadata.set(replyMessage.id, {
-                prompt: promptText,
+                prompt: refinedPrompt,
                 generatedImages: generatedImageData
             });
         } else if (combinedText) {
@@ -253,64 +309,6 @@ ${promptText}
     }
 }
 
-// Process text conversation
-async function handleTextConversation(message: Message, content: string, replyToMessageId?: string): Promise<void> {
-    let statusMessage: Message | null = null;
-    
-    try {
-        if (supportsTyping(message.channel)) {
-            await message.channel.sendTyping();
-        }
-        
-        // Get or create conversation history
-        const historyKey = replyToMessageId || message.id;
-        let history = conversationHistory.get(historyKey) || [];
-        
-        // Add user message to history
-        history.push({
-            role: 'user',
-            parts: content
-        });
-        
-        // Create chat session with history
-        const model = genAI.getGenerativeModel({ model: TEXT_MODEL_NAME });
-        const chat = model.startChat({
-            history: history.map(msg => ({
-                role: msg.role,
-                parts: [{ text: msg.parts }]
-            }))
-        });
-        
-        // Send message and get response
-        const result = await chat.sendMessage(content);
-        const response = await result.response;
-        const text = response.text();
-        
-        // Add model response to history
-        history.push({
-            role: 'model',
-            parts: text
-        });
-        
-        // Store updated history
-        conversationHistory.set(historyKey, history);
-        
-        // Send response
-        const replyMessage = await message.reply(text);
-        
-        // Store this message's history for threading
-        conversationHistory.set(replyMessage.id, history);
-        
-    } catch (error: any) {
-        console.error('Text Conversation Error:', error);
-        
-        let errorMessage = "An error occurred while processing your message.";
-        if (error.message?.includes('API key')) errorMessage = "Invalid or missing API Key.";
-        
-        message.reply(`❌ ${errorMessage}`);
-    }
-}
-
 client.on('messageCreate', async (message: Message) => {
     // Ignore bots
     if (message.author.bot) return;
@@ -322,78 +320,74 @@ client.on('messageCreate', async (message: Message) => {
     const content = message.content.replace(/<@!?[0-9]+>/g, '').trim();
     
     if (!content) {
-        message.reply("How can I help you? I can generate images or have a conversation with you!");
+        message.reply("Please provide a prompt to generate an image! Example: `@bot a cyberpunk scene` with a reference image attached.");
         return;
     }
 
-    // Check if this is a reply to a bot message
+    // Check if this is a reply to a bot message (for regeneration)
     if (message.reference?.messageId) {
         try {
             const repliedMessage = await message.channel.messages.fetch(message.reference.messageId);
             
-            // Check if replying to the bot
-            if (repliedMessage.author.id === client.user!.id) {
-                // Check if replying to an image generation
-                if (imageMetadata.has(repliedMessage.id)) {
-                    const metadata = imageMetadata.get(repliedMessage.id)!;
-                    
-                    // Regenerate with modified prompt and the previously generated images
-                    const modifiedPrompt = `${metadata.prompt}, ${content}`;
-                    await generateImages(message, modifiedPrompt, metadata.generatedImages || [], true);
+            // Check if replying to the bot's image generation (regeneration allowed without new reference)
+            if (repliedMessage.author.id === client.user!.id && imageMetadata.has(repliedMessage.id)) {
+                const metadata = imageMetadata.get(repliedMessage.id)!;
+                
+                // Regenerate with modified prompt and the previously generated images
+                const modifiedPrompt = `${metadata.prompt}, ${content}`;
+                await generateImages(message, modifiedPrompt, metadata.generatedImages || [], true);
+                return;
+            }
+            
+            // Replying to any message with attachments - use them as reference
+            if (repliedMessage.attachments.size > 0) {
+                console.log(`[DEBUG] User replied to a message with ${repliedMessage.attachments.size} attachments.`);
+                
+                const attachmentPromises = Array.from(repliedMessage.attachments.values()).map(async (attachment) => {
+                    if (!attachment.contentType?.startsWith('image/')) return null;
+                    try {
+                        const response = await fetch(attachment.url);
+                        const arrayBuffer = await response.arrayBuffer();
+                        return {
+                            inlineData: {
+                                data: Buffer.from(arrayBuffer).toString('base64'),
+                                mimeType: attachment.contentType
+                            }
+                        };
+                    } catch (err) {
+                        console.error(`Failed to download replied attachment:`, err);
+                        return null;
+                    }
+                });
+
+                const extraAttachments = (await Promise.all(attachmentPromises)).filter(a => a !== null);
+                
+                if (extraAttachments.length === 0) {
+                    message.reply("❌ **Reference image required!**\nPlease attach a reference image (your 3D voxel model) to your message, or reply to a message that has one.");
                     return;
                 }
                 
-                // Check if replying to a text conversation
-                if (conversationHistory.has(repliedMessage.id)) {
-                    await handleTextConversation(message, content, repliedMessage.id);
-                    return;
-                }
-            } else {
-                // Replying to a user message - check for attachments to use as context
-                if (wantsImageGeneration(content) && repliedMessage.attachments.size > 0) {
-                    console.log(`[DEBUG] User replied to a message with ${repliedMessage.attachments.size} attachments.`);
-                    
-                    const attachmentPromises = Array.from(repliedMessage.attachments.values()).map(async (attachment) => {
-                        if (!attachment.contentType?.startsWith('image/')) return null;
-                        try {
-                            const response = await fetch(attachment.url);
-                            const arrayBuffer = await response.arrayBuffer();
-                            return {
-                                inlineData: {
-                                    data: Buffer.from(arrayBuffer).toString('base64'),
-                                    mimeType: attachment.contentType
-                                }
-                            };
-                        } catch (err) {
-                            console.error(`Failed to download replied attachment:`, err);
-                            return null;
-                        }
-                    });
-
-                    const extraAttachments = (await Promise.all(attachmentPromises)).filter(a => a !== null);
-                    
-                    const prompt = extractPrompt(content);
-                    await generateImages(message, prompt, [], false, extraAttachments);
-                    return;
-                }
+                const prompt = extractPrompt(content);
+                await generateImages(message, prompt, [], false, extraAttachments);
+                return;
             }
         } catch (err) {
             console.error('Error fetching replied message:', err);
         }
     }
 
-    // Detect intent: image generation or text conversation
-    if (wantsImageGeneration(content)) {
-        // if (true) {
-        //     await message.reply(`❌ **Quota Exceeded**\nThe API returned a "Too Many Requests" error. This usually means:\n1. You are on the Free Tier and this model (${IMAGE_MODEL_NAME}) is not available for free (Limit: 0).\n2. Or you have hit the rate limit for the minute/day.\n\nPlease check your Google AI Studio billing settings.`);
-        //     return;
-        // }
-        
-        const prompt = extractPrompt(content);
-        await generateImages(message, prompt);
-    } else {
-        await handleTextConversation(message, content);
+    // Check if user attached a reference image directly
+    if (message.attachments.size > 0) {
+        const hasImage = Array.from(message.attachments.values()).some(att => att.contentType?.startsWith('image/'));
+        if (hasImage) {
+            const prompt = extractPrompt(content);
+            await generateImages(message, prompt);
+            return;
+        }
     }
+
+    // No reference image found - require it
+    message.reply("❌ **Reference image required!**\n\nPlease provide a reference image of your 3D voxel model. You can:\n1. **Attach an image** to your message with the bot mention\n2. **Reply to a message** that has an image attached\n\nExample: `@bot create a spooky forest background` (with your model image attached)");
 });
 
 // Login
