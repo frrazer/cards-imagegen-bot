@@ -1,6 +1,7 @@
-import { Client, GatewayIntentBits, Partials, Message, AttachmentBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Message, AttachmentBuilder, REST, Routes, Interaction } from 'discord.js';
 import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import dotenv from 'dotenv';
+import * as configCommand from './commands/config.js';
 
 dotenv.config();
 
@@ -39,10 +40,40 @@ const conversationHistory = new Map<string, ConversationMessage[]>();
 // Store image generation metadata: messageId -> generation data
 const imageMetadata = new Map<string, ImageGenerationData>();
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Logged in as ${client.user?.tag}!`);
     console.log(`Image Model: ${IMAGE_MODEL_NAME}`);
     console.log(`Text Model: ${TEXT_MODEL_NAME}`);
+
+    // Register Slash Commands
+    const commands = [configCommand.data.toJSON()];
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN!);
+
+    try {
+        console.log('Started refreshing application (/) commands.');
+        
+        await rest.put(
+            Routes.applicationCommands(client.user!.id),
+            { body: commands },
+        );
+
+        console.log('Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error(error);
+    }
+});
+
+// Interaction Handler
+client.on('interactionCreate', async (interaction: Interaction) => {
+    if (interaction.isChatInputCommand()) {
+        if (interaction.commandName === 'config') {
+            await configCommand.execute(interaction);
+        }
+    } else if (interaction.isAutocomplete()) {
+        if (interaction.commandName === 'config') {
+            await configCommand.autocomplete(interaction);
+        }
+    }
 });
 
 // Helper function to detect if user wants image generation
@@ -398,4 +429,3 @@ client.on('messageCreate', async (message: Message) => {
 
 // Login
 client.login(process.env.DISCORD_TOKEN);
-
